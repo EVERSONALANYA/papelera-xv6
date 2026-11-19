@@ -255,7 +255,8 @@ bad:
   return -1;
 }
 
-static struct inode *
+// Ya no es static: la usa también trash.c (papelera de reciclaje)
+struct inode *
 create(char *path, short type, short major, short minor)
 {
   struct inode *ip, *dp;
