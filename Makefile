@@ -155,6 +155,7 @@ UPROGS=\
 	$U/_trash\
 	$U/_restore\
 	$U/_emptytrash\
+	$U/_trashtest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

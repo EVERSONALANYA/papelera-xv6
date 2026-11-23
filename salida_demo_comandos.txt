@@ -1,0 +1,51 @@
+### Primera sesión
+init: starting sh
+$ echo hola mundo > nota.txt
+$ mkdir docs
+$ echo tarea de SO > docs/tarea.txt
+$ rm nota.txt
+rm: 'nota.txt' enviado a la papelera (id 1). Recuperalo con: restore 1
+$ rm docs/tarea.txt
+rm: 'docs/tarea.txt' enviado a la papelera (id 2). Recuperalo con: restore 2
+$ trash
+  ID   TAMANO  RUTA ORIGINAL
+----  -------  -------------------------
+   1       11  /nota.txt
+   2       12  /docs/tarea.txt
+
+2 archivo(s) en la papelera, 23 bytes en total.
+Recupera con: restore <id|nombre>   Vacia con: emptytrash
+$ ls docs
+.              1 30 48
+..             1 1 1024
+$ restore nota.txt
+restore: id 1 recuperado en /nota.txt
+$ cat nota.txt
+hola mundo
+$ rm docs
+$ rm console
+rm: console no se puede enviar a la papelera (dispositivo o ya esta en la papelera). Usa rm -f o emptytrash
+$ restore 7
+restore: no existe el id 7 en la papelera
+
+### Segunda sesión (después de reiniciar xv6: la papelera persiste en disco)
+init: starting sh
+$ trash
+  ID   TAMANO  RUTA ORIGINAL
+----  -------  -------------------------
+   2       12  /docs/tarea.txt
+
+1 archivo(s) en la papelera, 12 bytes en total.
+Recupera con: restore <id|nombre>   Vacia con: emptytrash
+$ mkdir docs
+$ restore tarea.txt
+restore: id 2 recuperado en /docs/tarea.txt
+$ cat docs/tarea.txt
+tarea de SO
+$ rm -f nota.txt
+$ rm docs/tarea.txt
+rm: 'docs/tarea.txt' enviado a la papelera (id 1). Recuperalo con: restore 1
+$ emptytrash -y
+Papelera vaciada: 1 archivo(s) eliminado(s) definitivamente.
+$ trash
+La papelera esta vacia.

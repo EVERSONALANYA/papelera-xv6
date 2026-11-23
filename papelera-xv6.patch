@@ -1,0 +1,1241 @@
+diff --git a/Makefile b/Makefile
+index a26f3db..c870871 100644
+--- a/Makefile
++++ b/Makefile
+@@ -26,6 +26,7 @@ OBJS = \
+   $K/pipe.o \
+   $K/exec.o \
+   $K/sysfile.o \
++  $K/trash.o \
+   $K/kernelvec.o \
+   $K/plic.o \
+   $K/virtio_disk.o
+@@ -151,6 +152,10 @@ UPROGS=\
+ 	$U/_forphan\
+ 	$U/_dorphan\
+ 	$U/_sync\
++	$U/_trash\
++	$U/_restore\
++	$U/_emptytrash\
++	$U/_trashtest\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 0ae6896..8db8d08 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -35,6 +35,9 @@ int             fileread(struct file*, uint64, int n);
+ int             filestat(struct file*, uint64 addr);
+ int             filewrite(struct file*, uint64, int n);
+ 
++// sysfile.c
++struct inode*   create(char*, short, short, short);
++
+ // fs.c
+ void            fsinit(int);
+ int             dirlink(struct inode*, char*, uint);
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index 1800f20..9deb9e3 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -103,6 +103,9 @@ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
+ extern uint64 sys_sync(void);
++extern uint64 sys_trash(void);
++extern uint64 sys_restore(void);
++extern uint64 sys_emptytrash(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -130,6 +133,9 @@ static uint64 (*syscalls[])(void) = {
+   [SYS_mkdir]   = sys_mkdir,
+   [SYS_close]   = sys_close,
+   [SYS_sync]    = sys_sync,
++  [SYS_trash]   = sys_trash,
++  [SYS_restore] = sys_restore,
++  [SYS_emptytrash] = sys_emptytrash,
+   // clang-format on
+ };
+ 
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index 5a4a39f..f55e637 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -21,3 +21,8 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_sync   22
++
++// Papelera de reciclaje
++#define SYS_trash      23
++#define SYS_restore    24
++#define SYS_emptytrash 25
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 7781287..03cd5ae 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -255,7 +255,8 @@ bad:
+   return -1;
+ }
+ 
+-static struct inode *
++// Ya no es static: la usa también trash.c (papelera de reciclaje)
++struct inode *
+ create(char *path, short type, short major, short minor)
+ {
+   struct inode *ip, *dp;
+diff --git a/kernel/trash.c b/kernel/trash.c
+new file mode 100644
+index 0000000..04df2cc
+--- /dev/null
++++ b/kernel/trash.c
+@@ -0,0 +1,456 @@
++//
++// trash.c - Papelera de reciclaje para xv6
++//
++// Proyecto final - IS-380 Sistemas Operativos (UNSCH)
++//
++// En xv6 original, unlink() (comando rm) elimina un archivo para siempre:
++// borra la entrada del directorio y, cuando nlink llega a 0, el inodo y sus
++// bloques de datos se liberan. Esta extensión agrega tres llamadas al sistema:
++//
++//   int trash(char *ruta)  Mueve el archivo a /.trash y devuelve su id (>0).
++//   int restore(int id)    Devuelve el archivo id a su ubicación original.
++//   int emptytrash(void)   Elimina definitivamente todo el contenido de /.trash.
++//
++// Cómo se guarda un archivo en la papelera:
++//   /.trash/<id>     enlace duro al MISMO inodo del archivo (no se copian datos)
++//   /.trash/<id>.p   archivo de metadatos con la ruta absoluta original
++//
++// Mover a la papelera es "enlazar en /.trash y desenlazar del directorio
++// original": el inodo nunca llega a nlink = 0, así que sus bloques NO se
++// liberan. Solo emptytrash() hace que nlink llegue a 0 y libera el espacio.
++//
++// Todas las modificaciones al disco se hacen dentro de transacciones del log
++// (begin_op / end_op), igual que sys_link y sys_unlink, para que una caída
++// del sistema no deje el sistema de archivos inconsistente.
++//
++
++#include "types.h"
++#include "riscv.h"
++#include "defs.h"
++#include "param.h"
++#include "stat.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "fs.h"
++#include "sleeplock.h"
++#include "file.h"
++#include "fcntl.h"
++#include "trash.h"
++
++#define TRASH_MAXDEPTH 32   // profundidad máxima de directorios al armar la ruta
++
++// Convierte un entero positivo a texto (el kernel no tiene sprintf).
++static void
++itoa(int n, char *buf)
++{
++  char tmp[12];
++  int i = 0, j = 0;
++
++  if (n == 0)
++    tmp[i++] = '0';
++  while (n > 0) {
++    tmp[i++] = '0' + (n % 10);
++    n /= 10;
++  }
++  while (i > 0)
++    buf[j++] = tmp[--i];
++  buf[j] = 0;
++}
++
++// Nombres de las dos entradas de un elemento: "<id>" y "<id>.p".
++static void
++idnames(int id, char *nombre, char *meta)
++{
++  int n;
++
++  itoa(id, nombre);
++  n = strlen(nombre);
++  memmove(meta, nombre, n);
++  meta[n] = '.';
++  meta[n + 1] = 'p';
++  meta[n + 2] = 0;
++}
++
++// Devuelve el inodo de /.trash (referenciado y SIN bloquear).
++// Si no existe y crear = 1, lo crea. Debe llamarse dentro de begin_op().
++static struct inode *
++trashdir(int crear)
++{
++  char ruta[] = TRASH_DIR;
++  struct inode *td;
++
++  if ((td = namei(ruta)) == 0) {
++    if (!crear)
++      return 0;
++    if ((td = create(ruta, T_DIR, 0, 0)) == 0)
++      return 0;
++    iunlock(td);           // create() lo devuelve bloqueado
++    return td;
++  }
++  ilock(td);
++  if (td->type != T_DIR) { // existe /.trash pero no es directorio
++    iunlockput(td);
++    return 0;
++  }
++  iunlock(td);
++  return td;
++}
++
++// Construye la ruta absoluta del directorio dir (referenciado, sin bloquear).
++// Sube por ".." hasta la raíz y en cada padre busca el nombre del hijo.
++// Bloquea un solo inodo a la vez para evitar interbloqueos con namei().
++static int
++dirpath(struct inode *dir, char *buf, int max)
++{
++  char tmp[MAXPATH];
++  int pos = MAXPATH - 1, len, profundidad = 0, hallado;
++  struct inode *cur, *padre;
++  struct dirent de;
++  uint off;
++
++  tmp[pos] = 0;
++  cur = idup(dir);
++  while (cur->inum != ROOTINO) {
++    if (++profundidad > TRASH_MAXDEPTH) {
++      iput(cur);
++      return -1;
++    }
++    ilock(cur);
++    padre = dirlookup(cur, "..", 0);
++    iunlock(cur);
++    if (padre == 0) {
++      iput(cur);
++      return -1;
++    }
++
++    // Buscar en el padre la entrada que apunta a cur.
++    ilock(padre);
++    hallado = 0;
++    for (off = 2 * sizeof(de); off < padre->size; off += sizeof(de)) {
++      if (readi(padre, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
++        break;
++      if (de.inum == cur->inum) {
++        hallado = 1;
++        break;
++      }
++    }
++    iunlock(padre);
++
++    if (!hallado) {
++      iput(cur);
++      iput(padre);
++      return -1;
++    }
++    for (len = 0; len < DIRSIZ && de.name[len]; len++)
++      ;
++    if (pos - len - 1 < 0) {
++      iput(cur);
++      iput(padre);
++      return -1;
++    }
++    pos -= len;
++    memmove(tmp + pos, de.name, len);
++    tmp[--pos] = '/';
++    iput(cur);
++    cur = padre;
++  }
++  iput(cur);
++
++  if (tmp[pos] == 0)       // el directorio era la raíz
++    tmp[--pos] = '/';
++  if (MAXPATH - pos > max)
++    return -1;
++  safestrcpy(buf, tmp + pos, max);
++  return 0;
++}
++
++// Elimina la entrada "nombre" del directorio dp (que debe estar BLOQUEADO)
++// y decrementa nlink del inodo. Si inum != 0, solo borra si la entrada
++// apunta a ese inodo. Es el núcleo de sys_unlink, para archivos comunes.
++static int
++removeent(struct inode *dp, char *nombre, uint inum)
++{
++  struct inode *ip;
++  struct dirent de;
++  uint off;
++
++  if ((ip = dirlookup(dp, nombre, &off)) == 0)
++    return -1;
++  if (inum != 0 && ip->inum != inum) {
++    iput(ip);
++    return -1;
++  }
++  ilock(ip);
++  if (ip->type == T_DIR) { // la papelera solo maneja archivos
++    iunlockput(ip);
++    return -1;
++  }
++  memset(&de, 0, sizeof(de));
++  if (writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
++    panic("trash: removeent");
++  ip->nlink--;
++  iupdate(ip);
++  iunlockput(ip);          // si nlink == 0, iput libera inodo y bloques
++  return 0;
++}
++
++// ---------------------------------------------------------------------------
++// int trash(char *ruta)
++// Devuelve el id (> 0) con el que el archivo quedó en la papelera, o:
++//   TRASH_ENOENT  el archivo no existe
++//   TRASH_EINVAL  no es un archivo común (directorio, dispositivo),
++//                 ya está en la papelera o la ruta es inválida
++//   TRASH_EFULL   la papelera está llena
++// ---------------------------------------------------------------------------
++uint64
++sys_trash(void)
++{
++  char ruta[MAXPATH], nombre[DIRSIZ + 1], orig[MAXPATH], completa[MAXPATH];
++  char idn[DIRSIZ], idp[DIRSIZ], meta[MAXPATH];
++  struct inode *td, *dp, *ip, *x, *mf;
++  int id, ret, len;
++
++  memset(nombre, 0, sizeof(nombre));
++  if (argstr(0, ruta, MAXPATH) < 0)
++    return TRASH_EINVAL;
++
++  // Transacción 1: asegurar que exista /.trash.
++  begin_op();
++  td = trashdir(1);
++  end_op();
++  if (td == 0)
++    return TRASH_EINVAL;
++
++  // Transacción 2: mover el archivo (enlazar en /.trash y desenlazar el original).
++  begin_op();
++  ret = TRASH_EINVAL;
++  if ((dp = nameiparent(ruta, nombre)) == 0) {
++    ret = TRASH_ENOENT;
++    goto fallo_td;
++  }
++  if (namecmp(nombre, ".") == 0 || namecmp(nombre, "..") == 0)
++    goto fallo_dp;
++  if (dp->inum == td->inum)      // no se recicla lo que ya está en la papelera
++    goto fallo_dp;
++  if (dirpath(dp, orig, MAXPATH) < 0)
++    goto fallo_dp;
++
++  // Ruta absoluta original = ruta del directorio + "/" + nombre.
++  len = strlen(orig);
++  if (len + 1 + strlen(nombre) + 1 > MAXPATH)
++    goto fallo_dp;
++  safestrcpy(completa, orig, MAXPATH);
++  if (len > 1)
++    completa[len++] = '/';
++  safestrcpy(completa + len, nombre, MAXPATH - len);
++
++  ilock(dp);
++  ip = dirlookup(dp, nombre, 0);
++  iunlock(dp);
++  if (ip == 0) {
++    ret = TRASH_ENOENT;
++    goto fallo_dp;
++  }
++  ilock(ip);
++  if (ip->type != T_FILE) {      // directorios y dispositivos no
++    iunlockput(ip);
++    goto fallo_dp;
++  }
++  ip->nlink++;                   // el nuevo enlace en /.trash
++  iupdate(ip);
++  iunlock(ip);
++
++  // Buscar el primer id libre y enlazar el inodo como /.trash/<id>.
++  ilock(td);
++  for (id = 1; id <= TRASH_MAXID; id++) {
++    idnames(id, idn, idp);
++    if ((x = dirlookup(td, idn, 0)) == 0 && (x = dirlookup(td, idp, 0)) == 0)
++      break;
++    iput(x);
++  }
++  if (id > TRASH_MAXID || dirlink(td, idn, ip->inum) < 0) {
++    iunlock(td);
++    ilock(ip);
++    ip->nlink--;                 // deshacer
++    iupdate(ip);
++    iunlockput(ip);
++    ret = TRASH_EFULL;
++    goto fallo_dp;
++  }
++  iunlock(td);
++
++  // Quitar la entrada del directorio original (como unlink).
++  ilock(dp);
++  if (removeent(dp, nombre, ip->inum) < 0) {
++    // La entrada cambió mientras tanto: deshacer el enlace en la papelera.
++    iunlockput(dp);
++    ilock(td);
++    removeent(td, idn, ip->inum);
++    iunlock(td);
++    iput(ip);
++    goto fallo_td;
++  }
++  iunlockput(dp);
++  iput(ip);
++  end_op();
++
++  // Transacción 3: escribir los metadatos /.trash/<id>.p con la ruta original.
++  begin_op();
++  safestrcpy(meta, TRASH_DIR "/", MAXPATH);
++  safestrcpy(meta + strlen(meta), idp, MAXPATH - strlen(meta));
++  if ((mf = create(meta, T_FILE, 0, 0)) != 0) {
++    writei(mf, 0, (uint64)completa, 0, strlen(completa));
++    iunlockput(mf);
++  }
++  iput(td);
++  end_op();
++  return id;
++
++fallo_dp:
++  iput(dp);
++fallo_td:
++  iput(td);
++  end_op();
++  return ret;
++}
++
++// ---------------------------------------------------------------------------
++// int restore(int id)
++// Devuelve 0 si el archivo volvió a su ruta original, o:
++//   TRASH_ENOENT  no hay ningún elemento con ese id
++//   TRASH_EEXIST  ya existe un archivo con ese nombre en la ruta original
++//   TRASH_ENODIR  el directorio original ya no existe
++//   TRASH_EINVAL  metadatos dañados
++// ---------------------------------------------------------------------------
++uint64
++sys_restore(void)
++{
++  char idn[DIRSIZ], idp[DIRSIZ], orig[MAXPATH], nombre[DIRSIZ + 1];
++  struct inode *td, *ip, *mf, *dp, *x;
++  int id, n, ret;
++
++  memset(nombre, 0, sizeof(nombre));
++  argint(0, &id);
++  if (id < 1 || id > TRASH_MAXID)
++    return TRASH_ENOENT;
++  idnames(id, idn, idp);
++
++  begin_op();
++  if ((td = trashdir(0)) == 0) {
++    end_op();
++    return TRASH_ENOENT;
++  }
++  ilock(td);
++  ip = dirlookup(td, idn, 0);
++  mf = dirlookup(td, idp, 0);
++  iunlock(td);
++
++  ret = TRASH_ENOENT;
++  if (ip == 0)
++    goto fin;
++  ret = TRASH_EINVAL;
++  if (mf == 0)
++    goto fin;
++
++  // Leer la ruta original guardada en <id>.p
++  ilock(mf);
++  n = readi(mf, 0, (uint64)orig, 0, MAXPATH - 1);
++  iunlock(mf);
++  if (n <= 0)
++    goto fin;
++  orig[n] = 0;
++
++  ret = TRASH_ENODIR;
++  if ((dp = nameiparent(orig, nombre)) == 0)
++    goto fin;
++  ilock(dp);
++  if (dp->type != T_DIR || dp->nlink == 0) {
++    iunlockput(dp);
++    goto fin;
++  }
++  if ((x = dirlookup(dp, nombre, 0)) != 0) { // ya hay un archivo con ese nombre
++    iput(x);
++    iunlockput(dp);
++    ret = TRASH_EEXIST;
++    goto fin;
++  }
++
++  // Enlazar el inodo de nuevo en su directorio original.
++  ilock(ip);
++  ip->nlink++;
++  iupdate(ip);
++  iunlock(ip);
++  if (dirlink(dp, nombre, ip->inum) < 0) {
++    iunlockput(dp);
++    ilock(ip);
++    ip->nlink--;
++    iupdate(ip);
++    iunlock(ip);
++    ret = TRASH_EINVAL;
++    goto fin;
++  }
++  iunlockput(dp);
++
++  // Quitarlo de la papelera: el elemento y su archivo de metadatos.
++  ilock(td);
++  removeent(td, idn, ip->inum);
++  removeent(td, idp, mf->inum);  // nlink de <id>.p llega a 0: se libera
++  iunlock(td);
++  ret = 0;
++
++fin:
++  if (ip)
++    iput(ip);
++  if (mf)
++    iput(mf);
++  iput(td);
++  end_op();
++  return ret;
++}
++
++// ---------------------------------------------------------------------------
++// int emptytrash(void)
++// Elimina definitivamente todo lo que hay en /.trash y libera su espacio.
++// Devuelve cuántos archivos se eliminaron. Usa una transacción por entrada
++// para no exceder el tamaño máximo de una operación del log (MAXOPBLOCKS).
++// ---------------------------------------------------------------------------
++uint64
++sys_emptytrash(void)
++{
++  struct inode *td;
++  struct dirent de;
++  char nombre[DIRSIZ + 1];
++  uint off, desde = 2 * sizeof(de);   // saltar "." y ".."
++  int cuenta = 0, hallado, len;
++
++  for (;;) {
++    begin_op();
++    if ((td = trashdir(0)) == 0) {
++      end_op();
++      break;
++    }
++    ilock(td);
++    hallado = 0;
++    for (off = desde; off < td->size; off += sizeof(de)) {
++      if (readi(td, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
++        break;
++      if (de.inum == 0)
++        continue;
++      memmove(nombre, de.name, DIRSIZ);
++      nombre[DIRSIZ] = 0;
++      hallado = 1;
++      desde = off + sizeof(de);
++      break;
++    }
++    if (hallado && removeent(td, nombre, de.inum) == 0) {
++      len = strlen(nombre);
++      if (!(len >= 2 && nombre[len - 2] == '.' && nombre[len - 1] == 'p'))
++        cuenta++;                // solo contamos archivos, no metadatos
++    }
++    iunlockput(td);
++    end_op();
++    if (!hallado)
++      break;
++  }
++  return cuenta;
++}
+diff --git a/kernel/trash.h b/kernel/trash.h
+new file mode 100644
+index 0000000..8aa5606
+--- /dev/null
++++ b/kernel/trash.h
+@@ -0,0 +1,11 @@
++// trash.h - Constantes de la papelera de reciclaje (kernel y programas de usuario)
++
++#define TRASH_DIR    "/.trash"   // directorio de la papelera
++#define TRASH_MAXID  9999        // máximo número de elementos
++
++// Códigos de retorno de trash() y restore()
++#define TRASH_ENOENT  -1   // no existe el archivo / el elemento
++#define TRASH_EEXIST  -2   // ya existe un archivo con ese nombre en el destino
++#define TRASH_ENODIR  -3   // el directorio original ya no existe
++#define TRASH_EINVAL  -4   // operación inválida (directorio, dispositivo, ya está en la papelera)
++#define TRASH_EFULL   -5   // la papelera está llena
+diff --git a/user/emptytrash.c b/user/emptytrash.c
+new file mode 100644
+index 0000000..2c73218
+--- /dev/null
++++ b/user/emptytrash.c
+@@ -0,0 +1,25 @@
++// emptytrash - vacía la papelera y libera definitivamente el espacio.
++// Uso: emptytrash [-y]    (-y: no pedir confirmación)
++
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  char resp[8];
++  int n;
++
++  if (!(argc >= 2 && strcmp(argv[1], "-y") == 0)) {
++    printf("Los archivos de la papelera se eliminaran para siempre. Continuar? (s/n): ");
++    gets(resp, sizeof(resp));
++    if (resp[0] != 's' && resp[0] != 'S') {
++      printf("Cancelado.\n");
++      exit(0);
++    }
++  }
++  n = emptytrash();
++  printf("Papelera vaciada: %d archivo(s) eliminado(s) definitivamente.\n", n);
++  exit(0);
++}
+diff --git a/user/restore.c b/user/restore.c
+new file mode 100644
+index 0000000..ca205a1
+--- /dev/null
++++ b/user/restore.c
+@@ -0,0 +1,64 @@
++// restore - recupera archivos de la papelera a su ubicación original.
++// Uso: restore <id|nombre>...
++//   restore 3          recupera el elemento con id 3
++//   restore notas.txt  recupera el "notas.txt" eliminado más recientemente
++
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/trash.h"
++#include "user/user.h"
++#include "user/trashlib.h"
++
++// Busca por nombre (o ruta completa) el elemento más reciente. 0 si no hay.
++static int
++buscarpornombre(char *nombre)
++{
++  char origen[MAXPATH];
++  int id;
++
++  for (id = maxid(); id >= 1; id--) {
++    if (leerorigen(id, origen, sizeof(origen)) < 0)
++      continue;
++    if (strcmp(origen, nombre) == 0 || strcmp(basename(origen), nombre) == 0)
++      return id;
++  }
++  return 0;
++}
++
++int
++main(int argc, char *argv[])
++{
++  int i, id, r, error = 0;
++  char origen[MAXPATH];
++
++  if (argc < 2) {
++    fprintf(2, "Uso: restore <id|nombre>...   (usa 'trash' para ver los ids)\n");
++    exit(1);
++  }
++
++  for (i = 1; i < argc; i++) {
++    id = esnumero(argv[i]) ? atoi(argv[i]) : buscarpornombre(argv[i]);
++    if (id == 0) {
++      fprintf(2, "restore: '%s' no esta en la papelera\n", argv[i]);
++      error = 1;
++      continue;
++    }
++    if (leerorigen(id, origen, sizeof(origen)) < 0)
++      strcpy(origen, "?");
++
++    r = restore(id);
++    if (r == 0)
++      printf("restore: id %d recuperado en %s\n", id, origen);
++    else if (r == TRASH_ENOENT)
++      fprintf(2, "restore: no existe el id %d en la papelera\n", id);
++    else if (r == TRASH_EEXIST)
++      fprintf(2, "restore: ya existe %s. Renombra o elimina ese archivo y vuelve a intentar\n", origen);
++    else if (r == TRASH_ENODIR)
++      fprintf(2, "restore: el directorio original de %s ya no existe. Crealo con mkdir y vuelve a intentar\n", origen);
++    else
++      fprintf(2, "restore: no se pudo recuperar el id %d\n", id);
++    if (r != 0)
++      error = 1;
++  }
++  exit(error);
++}
+diff --git a/user/rm.c b/user/rm.c
+index 7b4217b..602c72c 100644
+--- a/user/rm.c
++++ b/user/rm.c
+@@ -1,23 +1,57 @@
++// rm - elimina archivos.
++// Con la papelera de reciclaje: por defecto los archivos se envían a /.trash
++// y se pueden recuperar con "restore". Con -f se eliminan definitivamente.
++
+ #include "kernel/types.h"
+ #include "kernel/stat.h"
++#include "kernel/trash.h"
+ #include "user/user.h"
+ 
+ int
+ main(int argc, char *argv[])
+ {
+-  int i;
++  int i, inicio = 1, forzar = 0, id, error = 0;
++  struct stat st;
+ 
+-  if (argc < 2) {
+-    fprintf(2, "Usage: rm files...\n");
++  if (argc >= 2 && strcmp(argv[1], "-f") == 0) {
++    forzar = 1;
++    inicio = 2;
++  }
++  if (argc <= inicio) {
++    fprintf(2, "Uso: rm [-f] archivos...\n");
++    fprintf(2, "  sin -f : envia los archivos a la papelera (recuperables con restore)\n");
++    fprintf(2, "  -f     : elimina definitivamente\n");
+     exit(1);
+   }
+ 
+-  for (i = 1; i < argc; i++) {
+-    if (unlink(argv[i]) < 0) {
+-      fprintf(2, "rm: %s failed to delete\n", argv[i]);
+-      break;
++  for (i = inicio; i < argc; i++) {
++    if (forzar) {
++      if (unlink(argv[i]) < 0) {
++        fprintf(2, "rm: no se pudo eliminar %s\n", argv[i]);
++        error = 1;
++      }
++      continue;
+     }
+-  }
+ 
+-  exit(0);
++    id = trash(argv[i]);
++    if (id > 0) {
++      printf("rm: '%s' enviado a la papelera (id %d). Recuperalo con: restore %d\n", argv[i], id, id);
++    } else if (id == TRASH_ENOENT) {
++      fprintf(2, "rm: %s no existe\n", argv[i]);
++      error = 1;
++    } else if (id == TRASH_EINVAL && stat(argv[i], &st) == 0 && st.type == T_DIR) {
++      // Los directorios no pasan por la papelera: se eliminan como antes (si estan vacios).
++      if (unlink(argv[i]) < 0) {
++        fprintf(2, "rm: no se pudo eliminar el directorio %s (debe estar vacio)\n", argv[i]);
++        error = 1;
++      }
++    } else if (id == TRASH_EINVAL) {
++      fprintf(2, "rm: %s no se puede enviar a la papelera (dispositivo o ya esta en la papelera). Usa rm -f o emptytrash\n", argv[i]);
++      error = 1;
++    } else {
++      fprintf(2, "rm: la papelera esta llena; vaciala con emptytrash\n");
++      error = 1;
++    }
++  }
++  exit(error);
+ }
+diff --git a/user/trash.c b/user/trash.c
+new file mode 100644
+index 0000000..49fa37b
+--- /dev/null
++++ b/user/trash.c
+@@ -0,0 +1,58 @@
++// trash - muestra el contenido de la papelera de reciclaje.
++// Uso: trash
++
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/trash.h"
++#include "user/user.h"
++#include "user/trashlib.h"
++
++// Imprime un número ocupando al menos "ancho" columnas.
++static void
++pnum(int n, int ancho)
++{
++  char buf[12];
++  int i = 0;
++
++  do {
++    buf[i++] = '0' + n % 10;
++    n /= 10;
++  } while (n > 0);
++  for (int k = i; k < ancho; k++)
++    printf(" ");
++  while (i > 0)
++    printf("%c", buf[--i]);
++}
++
++int
++main(int argc, char *argv[])
++{
++  int id, max, total = 0, bytes = 0;
++  char ruta[32], origen[MAXPATH];
++  struct stat st;
++
++  max = maxid();
++  if (max == 0) {
++    printf("La papelera esta vacia.\n");
++    exit(0);
++  }
++
++  printf("  ID   TAMANO  RUTA ORIGINAL\n");
++  printf("----  -------  -------------------------\n");
++  for (id = 1; id <= max; id++) {
++    rutaitem(id, 0, ruta);
++    if (stat(ruta, &st) < 0)
++      continue;
++    if (leerorigen(id, origen, sizeof(origen)) < 0)
++      strcpy(origen, "(desconocida)");
++    pnum(id, 4);
++    printf("  ");
++    pnum((int)st.size, 7);
++    printf("  %s\n", origen);
++    total++;
++    bytes += st.size;
++  }
++  printf("\n%d archivo(s) en la papelera, %d bytes en total.\n", total, bytes);
++  printf("Recupera con: restore <id|nombre>   Vacia con: emptytrash\n");
++  exit(0);
++}
+diff --git a/user/trashlib.h b/user/trashlib.h
+new file mode 100644
+index 0000000..ad1a849
+--- /dev/null
++++ b/user/trashlib.h
+@@ -0,0 +1,90 @@
++// trashlib.h - funciones auxiliares de usuario para leer la papelera.
++// Lo incluyen trash.c y restore.c.
++
++#include "kernel/param.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++
++// ¿La cadena es un número entero positivo?
++static __attribute__((unused)) int
++esnumero(char *s)
++{
++  if (*s == 0)
++    return 0;
++  for (; *s; s++)
++    if (*s < '0' || *s > '9')
++      return 0;
++  return 1;
++}
++
++// Arma "/.trash/<id>" o "/.trash/<id>.p" en buf.
++static __attribute__((unused)) void
++rutaitem(int id, int meta, char *buf)
++{
++  char num[12];
++  int i = 0, j, n = id;
++
++  do {
++    num[i++] = '0' + n % 10;
++    n /= 10;
++  } while (n > 0);
++  strcpy(buf, TRASH_DIR "/");
++  j = strlen(buf);
++  while (i > 0)
++    buf[j++] = num[--i];
++  if (meta) {
++    buf[j++] = '.';
++    buf[j++] = 'p';
++  }
++  buf[j] = 0;
++}
++
++// Lee la ruta original de un elemento. Devuelve 0 si existe.
++static __attribute__((unused)) int
++leerorigen(int id, char *buf, int max)
++{
++  char ruta[32];
++  int fd, n;
++
++  rutaitem(id, 1, ruta);
++  if ((fd = open(ruta, O_RDONLY)) < 0)
++    return -1;
++  n = read(fd, buf, max - 1);
++  close(fd);
++  if (n < 0)
++    n = 0;
++  buf[n] = 0;
++  return 0;
++}
++
++// Mayor id presente en la papelera (0 si está vacía o no existe).
++static __attribute__((unused)) int
++maxid(void)
++{
++  int fd, id, max = 0;
++  struct dirent de;
++  char nombre[DIRSIZ + 1];
++
++  if ((fd = open(TRASH_DIR, O_RDONLY)) < 0)
++    return 0;
++  while (read(fd, &de, sizeof(de)) == sizeof(de)) {
++    if (de.inum == 0)
++      continue;
++    memmove(nombre, de.name, DIRSIZ);
++    nombre[DIRSIZ] = 0;
++    if (esnumero(nombre) && (id = atoi(nombre)) > max)
++      max = id;
++  }
++  close(fd);
++  return max;
++}
++
++// Devuelve el nombre final de una ruta ("/docs/a.txt" -> "a.txt").
++static __attribute__((unused)) char *
++basename(char *ruta)
++{
++  char *p = ruta + strlen(ruta);
++  while (p > ruta && *(p - 1) != '/')
++    p--;
++  return p;
++}
+diff --git a/user/trashtest.c b/user/trashtest.c
+new file mode 100644
+index 0000000..088ddcb
+--- /dev/null
++++ b/user/trashtest.c
+@@ -0,0 +1,311 @@
++// trashtest - pruebas automáticas de la papelera de reciclaje.
++// Uso: trashtest
++// Ejecuta cada caso de prueba e imprime el resultado esperado y el obtenido.
++
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/trash.h"
++#include "user/user.h"
++#include "user/trashlib.h"
++
++static int aprobadas = 0, total = 0;
++
++// ---------- utilidades ----------
++static int
++crear(char *ruta, char *texto)
++{
++  int fd = open(ruta, O_CREATE | O_TRUNC | O_WRONLY);
++  if (fd < 0)
++    return -1;
++  write(fd, texto, strlen(texto));
++  close(fd);
++  return 0;
++}
++
++static int
++leer(char *ruta, char *buf, int max)
++{
++  int fd = open(ruta, O_RDONLY), n;
++  if (fd < 0)
++    return -1;
++  n = read(fd, buf, max - 1);
++  close(fd);
++  buf[n < 0 ? 0 : n] = 0;
++  return n;
++}
++
++static int
++existe(char *ruta)
++{
++  struct stat st;
++  return stat(ruta, &st) == 0;
++}
++
++static int
++contenido(char *ruta, char *esperado)
++{
++  char buf[256];
++  return leer(ruta, buf, sizeof(buf)) >= 0 && strcmp(buf, esperado) == 0;
++}
++
++static int
++metaes(int id, char *esperado)
++{
++  char buf[MAXPATH];
++  return leerorigen(id, buf, sizeof(buf)) == 0 && strcmp(buf, esperado) == 0;
++}
++
++static void
++inicio(char *titulo, char *entrada, char *esperado)
++{
++  total++;
++  printf("\n[PRUEBA %d] %s\n", total, titulo);
++  printf("  Entrada  : %s\n", entrada);
++  printf("  Esperado : %s\n", esperado);
++}
++
++static void
++resultado(int ok, char *obtenido)
++{
++  printf("  Obtenido : %s\n", obtenido);
++  printf("  Resultado: %s\n", ok ? "APROBADA" : "FALLIDA <<<<<");
++  if (ok)
++    aprobadas++;
++}
++
++static int
++papeleravacia(void)
++{
++  int fd = open(TRASH_DIR, O_RDONLY);
++  struct dirent de;
++  int n = 0;
++  if (fd < 0)
++    return 1;
++  while (read(fd, &de, sizeof(de)) == sizeof(de))
++    if (de.inum != 0)
++      n++;
++  close(fd);
++  return n == 2;     // solo "." y ".."
++}
++
++// ---------- casos de prueba ----------
++void
++prueba_enviar(void)
++{
++  int id;
++  char ruta[32];
++
++  inicio("Enviar un archivo a la papelera",
++         "crear /t_a.txt con \"hola papelera\"; trash(\"/t_a.txt\")",
++         "id > 0, /t_a.txt ya no existe, /.trash/<id> existe y guarda la ruta /t_a.txt");
++  crear("/t_a.txt", "hola papelera");
++  id = trash("/t_a.txt");
++  rutaitem(id > 0 ? id : 1, 0, ruta);
++  int ok = id > 0 && !existe("/t_a.txt") && existe(ruta) && metaes(id, "/t_a.txt");
++  printf("  (id devuelto = %d)\n", id);
++  resultado(ok, ok ? "id valido, archivo movido y ruta original guardada" : "el archivo no se movio correctamente");
++
++  inicio("Restaurar el archivo con el mismo contenido",
++         "restore(id de la prueba 1)",
++         "restore devuelve 0 y /t_a.txt vuelve con \"hola papelera\"");
++  int r = restore(id);
++  ok = r == 0 && contenido("/t_a.txt", "hola papelera") && !existe(ruta);
++  printf("  (restore devolvio %d)\n", r);
++  resultado(ok, ok ? "archivo recuperado con su contenido original" : "no se recupero correctamente");
++}
++
++void
++prueba_subdirectorio(void)
++{
++  int id, r, ok;
++
++  inicio("Ruta relativa dentro de un subdirectorio",
++         "mkdir /t_docs; cd /t_docs; crear notas.txt; trash(\"notas.txt\"); cd /",
++         "la papelera guarda la ruta absoluta /t_docs/notas.txt y restore la devuelve ahi");
++  mkdir("/t_docs");
++  chdir("/t_docs");
++  crear("notas.txt", "apuntes de SO");
++  id = trash("notas.txt");
++  chdir("/");
++  int meta = metaes(id, "/t_docs/notas.txt");
++  r = restore(id);
++  ok = id > 0 && meta && r == 0 && contenido("/t_docs/notas.txt", "apuntes de SO");
++  printf("  (id = %d, ruta guardada correcta = %s, restore = %d)\n", id, meta ? "si" : "no", r);
++  resultado(ok, ok ? "ruta absoluta reconstruida y archivo restaurado en /t_docs" : "ruta o restauracion incorrecta");
++}
++
++void
++prueba_conflicto(void)
++{
++  int id, r1, r2, ok;
++  char ruta[32];
++
++  inicio("Conflicto: ya existe un archivo con el mismo nombre",
++         "trash(\"/t_a.txt\"); crear otro /t_a.txt \"nuevo\"; restore(id)",
++         "restore devuelve TRASH_EEXIST (-2) y NO sobrescribe; tras borrar el nuevo, restore funciona");
++  id = trash("/t_a.txt");
++  crear("/t_a.txt", "nuevo");
++  r1 = restore(id);
++  rutaitem(id, 0, ruta);
++  int protegido = contenido("/t_a.txt", "nuevo") && existe(ruta);
++  unlink("/t_a.txt");
++  r2 = restore(id);
++  ok = r1 == TRASH_EEXIST && protegido && r2 == 0 && contenido("/t_a.txt", "hola papelera");
++  printf("  (1er restore = %d, archivo nuevo intacto = %s, 2do restore = %d)\n", r1, protegido ? "si" : "no", r2);
++  resultado(ok, ok ? "se detecto el conflicto sin perder datos" : "el conflicto no se manejo bien");
++}
++
++void
++prueba_dir_eliminado(void)
++{
++  int id, r, ok;
++
++  inicio("El directorio original ya no existe",
++         "mkdir /t_tmp; crear /t_tmp/x.txt; trash; unlink(\"/t_tmp\"); restore(id)",
++         "restore devuelve TRASH_ENODIR (-3); al recrear /t_tmp, restore funciona");
++  mkdir("/t_tmp");
++  crear("/t_tmp/x.txt", "dato");
++  id = trash("/t_tmp/x.txt");
++  unlink("/t_tmp");
++  r = restore(id);
++  mkdir("/t_tmp");
++  int r2 = restore(id);
++  ok = id > 0 && r == TRASH_ENODIR && r2 == 0 && contenido("/t_tmp/x.txt", "dato");
++  printf("  (restore sin directorio = %d, despues de mkdir = %d)\n", r, r2);
++  resultado(ok, ok ? "error detectado y recuperacion posterior correcta" : "comportamiento incorrecto");
++}
++
++void
++prueba_invalidas(void)
++{
++  int a, b, c, d, e, f, ok, id;
++  char ruta[32];
++
++  inicio("Operaciones invalidas",
++         "trash de archivo inexistente, de un directorio, del dispositivo /console y de un elemento de /.trash; restore(9999) y restore(0)",
++         "-1, -4, -4, -4, -1, -1 (ninguna modifica el sistema de archivos)");
++  a = trash("/no_existe.txt");
++  b = trash("/t_docs");
++  c = trash("/console");
++  crear("/t_c.txt", "c");
++  id = trash("/t_c.txt");
++  rutaitem(id, 0, ruta);
++  d = trash(ruta);
++  e = restore(9999);
++  f = restore(0);
++  ok = a == TRASH_ENOENT && b == TRASH_EINVAL && c == TRASH_EINVAL && d == TRASH_EINVAL &&
++       e == TRASH_ENOENT && f == TRASH_ENOENT && existe("/t_docs") && existe("/console");
++  printf("  (obtenidos: %d, %d, %d, %d, %d, %d)\n", a, b, c, d, e, f);
++  resultado(ok, ok ? "todas las operaciones invalidas fueron rechazadas" : "alguna operacion invalida fue aceptada");
++}
++
++void
++prueba_mismo_nombre(void)
++{
++  int id1, id2, ok;
++
++  inicio("Eliminar dos veces un archivo con el mismo nombre",
++         "crear /t_b.txt \"version 1\"; trash; crear /t_b.txt \"version 2\"; trash",
++         "ids distintos; se puede recuperar cualquiera de las dos versiones");
++  crear("/t_b.txt", "version 1");
++  id1 = trash("/t_b.txt");
++  crear("/t_b.txt", "version 2");
++  id2 = trash("/t_b.txt");
++  int r2 = restore(id2);
++  int v2 = contenido("/t_b.txt", "version 2");
++  unlink("/t_b.txt");
++  int r1 = restore(id1);
++  int v1 = contenido("/t_b.txt", "version 1");
++  ok = id1 > 0 && id2 > 0 && id1 != id2 && r1 == 0 && r2 == 0 && v1 && v2;
++  printf("  (id1 = %d, id2 = %d, version 2 ok = %s, version 1 ok = %s)\n", id1, id2, v2 ? "si" : "no", v1 ? "si" : "no");
++  resultado(ok, ok ? "ambas versiones se conservaron por separado" : "se perdio alguna version");
++}
++
++void
++prueba_archivo_grande(void)
++{
++  int fd, i, id, r, ok = 1;
++  char bloque[512];
++
++  inicio("Archivo grande (usa bloques directos e indirectos)",
++         "crear /t_big.dat de 20 KB (40 bloques de 512 bytes con patron); trash; restore",
++         "los 20 KB se recuperan identicos (no se copian datos: es el mismo inodo)");
++  fd = open("/t_big.dat", O_CREATE | O_TRUNC | O_WRONLY);
++  for (i = 0; i < 40; i++) {
++    memset(bloque, 'A' + (i % 26), sizeof(bloque));
++    write(fd, bloque, sizeof(bloque));
++  }
++  close(fd);
++  struct stat antes, despues;
++  stat("/t_big.dat", &antes);
++  id = trash("/t_big.dat");
++  r = restore(id);
++  stat("/t_big.dat", &despues);
++  fd = open("/t_big.dat", O_RDONLY);
++  for (i = 0; i < 40 && ok; i++) {
++    if (read(fd, bloque, sizeof(bloque)) != sizeof(bloque))
++      ok = 0;
++    for (int k = 0; k < sizeof(bloque) && ok; k++)
++      if (bloque[k] != 'A' + (i % 26))
++        ok = 0;
++  }
++  close(fd);
++  ok = ok && id > 0 && r == 0 && despues.size == 20480 && antes.ino == despues.ino;
++  printf("  (tamano = %d bytes, inodo antes = %d, inodo despues = %d)\n", (int)despues.size, antes.ino, despues.ino);
++  resultado(ok, ok ? "contenido identico y mismo numero de inodo" : "datos corruptos o inodo distinto");
++  unlink("/t_big.dat");
++}
++
++void
++prueba_vaciar(void)
++{
++  int i1, i2, i3, n, ok;
++
++  inicio("Vaciar la papelera",
++         "trash de 3 archivos; emptytrash()",
++         "emptytrash devuelve >= 3, /.trash queda vacia y esos ids ya no se pueden restaurar");
++  crear("/t_1.txt", "1");
++  crear("/t_2.txt", "2");
++  crear("/t_3.txt", "3");
++  i1 = trash("/t_1.txt");
++  i2 = trash("/t_2.txt");
++  i3 = trash("/t_3.txt");
++  n = emptytrash();
++  ok = n >= 3 && papeleravacia() && restore(i1) == TRASH_ENOENT &&
++       restore(i2) == TRASH_ENOENT && restore(i3) == TRASH_ENOENT && !existe("/t_1.txt");
++  printf("  (archivos eliminados = %d, papelera vacia = %s)\n", n, papeleravacia() ? "si" : "no");
++  resultado(ok, ok ? "papelera vaciada y espacio liberado" : "la papelera no se vacio correctamente");
++}
++
++int
++main(void)
++{
++  printf("=============================================\n");
++  printf("  PRUEBAS DE LA PAPELERA DE RECICLAJE - xv6\n");
++  printf("=============================================\n");
++
++  // Estado inicial limpio
++  emptytrash();
++  unlink("/t_a.txt"); unlink("/t_b.txt");
++  unlink("/t_docs/notas.txt"); unlink("/t_docs");
++  unlink("/t_tmp/x.txt"); unlink("/t_tmp");
++
++  prueba_enviar();          // pruebas 1 y 2
++  prueba_subdirectorio();   // prueba 3
++  prueba_conflicto();       // prueba 4
++  prueba_dir_eliminado();   // prueba 5
++  prueba_invalidas();       // prueba 6
++  prueba_mismo_nombre();    // prueba 7
++  prueba_archivo_grande();  // prueba 8
++  prueba_vaciar();          // prueba 9
++
++  // Limpieza
++  unlink("/t_a.txt"); unlink("/t_b.txt");
++  unlink("/t_docs/notas.txt"); unlink("/t_docs");
++  unlink("/t_tmp/x.txt"); unlink("/t_tmp");
++
++  printf("\n=============================================\n");
++  printf("  RESULTADO: %d de %d pruebas aprobadas\n", aprobadas, total);
++  printf("=============================================\n");
++  exit(aprobadas == total ? 0 : 1);
++}
+diff --git a/user/user.h b/user/user.h
+index 29aad59..58cc6f6 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -25,6 +25,9 @@ char *sys_sbrk(int, int);
+ int pause(int);
+ int uptime(void);
+ int sync(void);
++int trash(const char *);
++int restore(int);
++int emptytrash(void);
+ 
+ // ulib.c
+ int stat(const char *, struct stat *);
+diff --git a/user/usys.pl b/user/usys.pl
+index 4d054e8..aff30ad 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -43,3 +43,6 @@ entry("sbrk");
+ entry("pause");
+ entry("uptime");
+ entry("sync");
++entry("trash");
++entry("restore");
++entry("emptytrash");

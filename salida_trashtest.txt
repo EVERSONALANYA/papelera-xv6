@@ -1,0 +1,70 @@
+=============================================
+  PRUEBAS DE LA PAPELERA DE RECICLAJE - xv6
+=============================================
+
+[PRUEBA 1] Enviar un archivo a la papelera
+  Entrada  : crear /t_a.txt con "hola papelera"; trash("/t_a.txt")
+  Esperado : id > 0, /t_a.txt ya no existe, /.trash/<id> existe y guarda la ruta /t_a.txt
+  (id devuelto = 1)
+  Obtenido : id valido, archivo movido y ruta original guardada
+  Resultado: APROBADA
+
+[PRUEBA 2] Restaurar el archivo con el mismo contenido
+  Entrada  : restore(id de la prueba 1)
+  Esperado : restore devuelve 0 y /t_a.txt vuelve con "hola papelera"
+  (restore devolvio 0)
+  Obtenido : archivo recuperado con su contenido original
+  Resultado: APROBADA
+
+[PRUEBA 3] Ruta relativa dentro de un subdirectorio
+  Entrada  : mkdir /t_docs; cd /t_docs; crear notas.txt; trash("notas.txt"); cd /
+  Esperado : la papelera guarda la ruta absoluta /t_docs/notas.txt y restore la devuelve ahi
+  (id = 1, ruta guardada correcta = si, restore = 0)
+  Obtenido : ruta absoluta reconstruida y archivo restaurado en /t_docs
+  Resultado: APROBADA
+
+[PRUEBA 4] Conflicto: ya existe un archivo con el mismo nombre
+  Entrada  : trash("/t_a.txt"); crear otro /t_a.txt "nuevo"; restore(id)
+  Esperado : restore devuelve TRASH_EEXIST (-2) y NO sobrescribe; tras borrar el nuevo, restore funciona
+  (1er restore = -2, archivo nuevo intacto = si, 2do restore = 0)
+  Obtenido : se detecto el conflicto sin perder datos
+  Resultado: APROBADA
+
+[PRUEBA 5] El directorio original ya no existe
+  Entrada  : mkdir /t_tmp; crear /t_tmp/x.txt; trash; unlink("/t_tmp"); restore(id)
+  Esperado : restore devuelve TRASH_ENODIR (-3); al recrear /t_tmp, restore funciona
+  (restore sin directorio = -3, despues de mkdir = 0)
+  Obtenido : error detectado y recuperacion posterior correcta
+  Resultado: APROBADA
+
+[PRUEBA 6] Operaciones invalidas
+  Entrada  : trash de archivo inexistente, de un directorio, del dispositivo /console y de un elemento de /.trash; restore(9999) y restore(0)
+  Esperado : -1, -4, -4, -4, -1, -1 (ninguna modifica el sistema de archivos)
+  (obtenidos: -1, -4, -4, -4, -1, -1)
+  Obtenido : todas las operaciones invalidas fueron rechazadas
+  Resultado: APROBADA
+
+[PRUEBA 7] Eliminar dos veces un archivo con el mismo nombre
+  Entrada  : crear /t_b.txt "version 1"; trash; crear /t_b.txt "version 2"; trash
+  Esperado : ids distintos; se puede recuperar cualquiera de las dos versiones
+  (id1 = 2, id2 = 3, version 2 ok = si, version 1 ok = si)
+  Obtenido : ambas versiones se conservaron por separado
+  Resultado: APROBADA
+
+[PRUEBA 8] Archivo grande (usa bloques directos e indirectos)
+  Entrada  : crear /t_big.dat de 20 KB (40 bloques de 512 bytes con patron); trash; restore
+  Esperado : los 20 KB se recuperan identicos (no se copian datos: es el mismo inodo)
+  (tamano = 20480 bytes, inodo antes = 37, inodo despues = 37)
+  Obtenido : contenido identico y mismo numero de inodo
+  Resultado: APROBADA
+
+[PRUEBA 9] Vaciar la papelera
+  Entrada  : trash de 3 archivos; emptytrash()
+  Esperado : emptytrash devuelve >= 3, /.trash queda vacia y esos ids ya no se pueden restaurar
+  (archivos eliminados = 4, papelera vacia = si)
+  Obtenido : papelera vaciada y espacio liberado
+  Resultado: APROBADA
+
+=============================================
+  RESULTADO: 9 de 9 pruebas aprobadas
+=============================================
