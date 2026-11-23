@@ -314,4 +314,143 @@ fallo_td:
   return ret;
 }
 
-// (restore y emptytrash se agregan en el siguiente commit)
+// ---------------------------------------------------------------------------
+// int restore(int id)
+// Devuelve 0 si el archivo volvió a su ruta original, o:
+//   TRASH_ENOENT  no hay ningún elemento con ese id
+//   TRASH_EEXIST  ya existe un archivo con ese nombre en la ruta original
+//   TRASH_ENODIR  el directorio original ya no existe
+//   TRASH_EINVAL  metadatos dañados
+// ---------------------------------------------------------------------------
+uint64
+sys_restore(void)
+{
+  char idn[DIRSIZ], idp[DIRSIZ], orig[MAXPATH], nombre[DIRSIZ + 1];
+  struct inode *td, *ip, *mf, *dp, *x;
+  int id, n, ret;
+
+  memset(nombre, 0, sizeof(nombre));
+  argint(0, &id);
+  if (id < 1 || id > TRASH_MAXID)
+    return TRASH_ENOENT;
+  idnames(id, idn, idp);
+
+  begin_op();
+  if ((td = trashdir(0)) == 0) {
+    end_op();
+    return TRASH_ENOENT;
+  }
+  ilock(td);
+  ip = dirlookup(td, idn, 0);
+  mf = dirlookup(td, idp, 0);
+  iunlock(td);
+
+  ret = TRASH_ENOENT;
+  if (ip == 0)
+    goto fin;
+  ret = TRASH_EINVAL;
+  if (mf == 0)
+    goto fin;
+
+  // Leer la ruta original guardada en <id>.p
+  ilock(mf);
+  n = readi(mf, 0, (uint64)orig, 0, MAXPATH - 1);
+  iunlock(mf);
+  if (n <= 0)
+    goto fin;
+  orig[n] = 0;
+
+  ret = TRASH_ENODIR;
+  if ((dp = nameiparent(orig, nombre)) == 0)
+    goto fin;
+  ilock(dp);
+  if (dp->type != T_DIR || dp->nlink == 0) {
+    iunlockput(dp);
+    goto fin;
+  }
+  if ((x = dirlookup(dp, nombre, 0)) != 0) { // ya hay un archivo con ese nombre
+    iput(x);
+    iunlockput(dp);
+    ret = TRASH_EEXIST;
+    goto fin;
+  }
+
+  // Enlazar el inodo de nuevo en su directorio original.
+  ilock(ip);
+  ip->nlink++;
+  iupdate(ip);
+  iunlock(ip);
+  if (dirlink(dp, nombre, ip->inum) < 0) {
+    iunlockput(dp);
+    ilock(ip);
+    ip->nlink--;
+    iupdate(ip);
+    iunlock(ip);
+    ret = TRASH_EINVAL;
+    goto fin;
+  }
+  iunlockput(dp);
+
+  // Quitarlo de la papelera: el elemento y su archivo de metadatos.
+  ilock(td);
+  removeent(td, idn, ip->inum);
+  removeent(td, idp, mf->inum);  // nlink de <id>.p llega a 0: se libera
+  iunlock(td);
+  ret = 0;
+
+fin:
+  if (ip)
+    iput(ip);
+  if (mf)
+    iput(mf);
+  iput(td);
+  end_op();
+  return ret;
+}
+
+// ---------------------------------------------------------------------------
+// int emptytrash(void)
+// Elimina definitivamente todo lo que hay en /.trash y libera su espacio.
+// Devuelve cuántos archivos se eliminaron. Usa una transacción por entrada
+// para no exceder el tamaño máximo de una operación del log (MAXOPBLOCKS).
+// ---------------------------------------------------------------------------
+uint64
+sys_emptytrash(void)
+{
+  struct inode *td;
+  struct dirent de;
+  char nombre[DIRSIZ + 1];
+  uint off, desde = 2 * sizeof(de);   // saltar "." y ".."
+  int cuenta = 0, hallado, len;
+
+  for (;;) {
+    begin_op();
+    if ((td = trashdir(0)) == 0) {
+      end_op();
+      break;
+    }
+    ilock(td);
+    hallado = 0;
+    for (off = desde; off < td->size; off += sizeof(de)) {
+      if (readi(td, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+        break;
+      if (de.inum == 0)
+        continue;
+      memmove(nombre, de.name, DIRSIZ);
+      nombre[DIRSIZ] = 0;
+      hallado = 1;
+      desde = off + sizeof(de);
+      break;
+    }
+    if (hallado && removeent(td, nombre, de.inum) == 0) {
+      len = strlen(nombre);
+      if (!(len >= 2 && nombre[len - 2] == '.' && nombre[len - 1] == 'p'))
+        cuenta++;                // solo contamos archivos, no metadatos
+    }
+    iunlockput(td);
+    end_op();
+    if (!hallado)
+      break;
+  }
+  return cuenta;
+}
