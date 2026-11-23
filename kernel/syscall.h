@@ -21,3 +21,8 @@
 #define SYS_mkdir  20
 #define SYS_close  21
 #define SYS_sync   22
+
+// Papelera de reciclaje
+#define SYS_trash      23
+#define SYS_restore    24
+#define SYS_emptytrash 25
