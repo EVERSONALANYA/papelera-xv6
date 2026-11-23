@@ -1,81 +1,58 @@
+// trash - muestra el contenido de la papelera de reciclaje.
+// Uso: trash
+
 #include "kernel/types.h"
 #include "kernel/stat.h"
-#include "kernel/fs.h"
-#include "kernel/fcntl.h"
+#include "kernel/trash.h"
 #include "user/user.h"
+#include "user/trashlib.h"
+
+// Imprime un número ocupando al menos "ancho" columnas.
+static void
+pnum(int n, int ancho)
+{
+  char buf[12];
+  int i = 0;
+
+  do {
+    buf[i++] = '0' + n % 10;
+    n /= 10;
+  } while (n > 0);
+  for (int k = i; k < ancho; k++)
+    printf(" ");
+  while (i > 0)
+    printf("%c", buf[--i]);
+}
 
 int
 main(int argc, char *argv[])
 {
-  int fd, mf, n;
-  struct dirent de;
+  int id, max, total = 0, bytes = 0;
+  char ruta[32], origen[MAXPATH];
   struct stat st;
-  char nombre[DIRSIZ + 1];
-  char ruta[128];
-  char meta[128];
-  char original[256];
 
-  if(argc != 1){
-    fprintf(2, "Uso: trash\n");
-    exit(1);
+  max = maxid();
+  if (max == 0) {
+    printf("La papelera esta vacia.\n");
+    exit(0);
   }
 
-  fd = open("/.trash", O_RDONLY);
-  if(fd < 0){
-    fprintf(2, "trash: no existe la papelera\n");
-    exit(1);
+  printf("  ID   TAMANO  RUTA ORIGINAL\n");
+  printf("----  -------  -------------------------\n");
+  for (id = 1; id <= max; id++) {
+    rutaitem(id, 0, ruta);
+    if (stat(ruta, &st) < 0)
+      continue;
+    if (leerorigen(id, origen, sizeof(origen)) < 0)
+      strcpy(origen, "(desconocida)");
+    pnum(id, 4);
+    printf("  ");
+    pnum((int)st.size, 7);
+    printf("  %s\n", origen);
+    total++;
+    bytes += st.size;
   }
-
-  printf("ID\tTAMANO\tRUTA ORIGINAL\n");
-
-  while(read(fd, &de, sizeof(de)) == sizeof(de)){
-    if(de.inum == 0)
-      continue;
-
-    memset(nombre, 0, sizeof(nombre));
-    memmove(nombre, de.name, DIRSIZ);
-
-    if(strcmp(nombre, ".") == 0 ||
-       strcmp(nombre, "..") == 0)
-      continue;
-
-    int valido = 1;
-    for(int i = 0; nombre[i]; i++){
-      if(nombre[i] < '0' || nombre[i] > '9'){
-        valido = 0;
-        break;
-      }
-    }
-
-    if(!valido)
-      continue;
-
-    strcpy(ruta, "/.trash/");
-    strcpy(ruta + strlen(ruta), nombre);
-
-    if(stat(ruta, &st) < 0)
-      continue;
-
-    strcpy(meta, ruta);
-    strcpy(meta + strlen(meta), ".p");
-
-    mf = open(meta, O_RDONLY);
-    if(mf < 0)
-      continue;
-
-    memset(original, 0, sizeof(original));
-    n = read(mf, original, sizeof(original) - 1);
-    close(mf);
-
-    if(n < 0)
-      continue;
-
-    original[n] = 0;
-
-    printf("%s\t%d\t%s\n",
-           nombre, (int)st.size, original);
-  }
-
-  close(fd);
+  printf("\n%d archivo(s) en la papelera, %d bytes en total.\n", total, bytes);
+  printf("Recupera con: restore <id|nombre>   Vacia con: emptytrash\n");
   exit(0);
 }
