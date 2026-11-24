@@ -8,9 +8,9 @@ Docente: Ing. Lizbeth Jaico Quispe
 | Integrante | Usuario de GitHub | Aporte principal |
 |---|---|---|
 | Everson Alanya Tinco | @EVERSONALANYA | Llamada al sistema `trash()` y funciones base del kernel |
-| _Integrante 2_ | _@usuario_ | Llamadas `restore()` y `emptytrash()`, registro de las syscalls |
-| _Integrante 3_ | _@usuario_ | Comandos de usuario `rm`, `trash`, `restore`, `emptytrash` |
-| _Integrante 4_ | _@usuario_ | Programa de pruebas `trashtest`, evidencias y documentación |
+| Luis Lloclla Sauñe | @luislloclla27-del | Llamadas `restore()` y `emptytrash()`, registro de las syscalls |
+| Wilder Hinostroza Rivera | @WilderHinostroza | Comandos de usuario `rm`, `trash`, `restore`, `emptytrash` |
+| Samuel Barzola Navarro | @samue-cpu | Programa de pruebas `trashtest`, evidencias y documentación |
 
 ---
 
